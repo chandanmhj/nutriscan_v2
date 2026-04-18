@@ -19,8 +19,8 @@ from telegram.ext import (
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger("nutriscan")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GROQ_API_KEY   = os.getenv("GROQ_API_KEY")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+GROQ_API_KEY   = os.getenv("GROQ_API_KEY",   "YOUR_GROQ_API_KEY")
 DB_PATH        = os.getenv("DB_PATH", "nutriscan.db")
 DEFAULT_GOAL   = 2000
 
@@ -148,23 +148,83 @@ def fmt_summary(chat_id, u):
         f"🥩`{t.get('protein',0):.1f}g` 🍞`{t.get('carbs',0):.1f}g` 🧈`{t.get('fat',0):.1f}g` 🍬`{t.get('sugar',0):.1f}g`",
         f"📝 Entries: `{t.get('entries',0)}`"])
 
-def fmt_label(data):
-    svgs = data.get("servings_per_container")
-    svgs_txt = f"{svgs}srv×{data.get('serving_size','?')}" if svgs else data.get("serving_size","?")
-    lines = [f"🏷️ *{data.get('food_name','Product')}* | {svgs_txt}","",
-             f"🔥 *{data.get('calories',0):.0f} kcal* _(whole packet)_","",
-             f"🥩`{data.get('protein_g',0):.1f}g` 🍞`{data.get('carbs_g',0):.1f}g` 🧈`{data.get('fat_g',0):.1f}g`"]
-    if data.get("sugar_g") is not None: lines.append(f"🍬 Sugar `{data.get('sugar_g',0):.1f}g`")
-    return "\n".join(lines)
+VERDICT_EMOJI = {
+    "excellent": "🌟", "good": "✅", "moderate": "🟡", "poor": "🔴", "avoid": "☠️"
+}
 
-def fmt_food(data, qty):
-    ce = {"low":"🔴","medium":"🟡","high":"🟢"}.get(data.get("confidence","medium"),"🟡")
-    lines = [f"🍽️ *{data.get('food_name','Food')}* — _{qty}_","",
-             f"🔥 *{data.get('calories',0):.0f} kcal* {ce}","",
-             f"🥩`{data.get('protein_g',0):.1f}g` 🍞`{data.get('carbs_g',0):.1f}g` 🧈`{data.get('fat_g',0):.1f}g`"]
-    if data.get("sugar_g") is not None: lines.append(f"🍬 Sugar `{data.get('sugar_g',0):.1f}g`")
-    if data.get("notes"): lines.append(f"ℹ️ _{data['notes']}_")
-    return "\n".join(lines)
+def fmt_result(data, qty=None):
+    """Rich formatter matching the old NutriScan style — works for both LABEL and FOOD."""
+    itype      = data.get("type", "FOOD")
+    name       = data.get("food_name", "This product")
+    verdict    = data.get("overall_verdict", "moderate")
+    v_emoji    = VERDICT_EMOJI.get(verdict, "🟡")
+    short_sum  = data.get("short_summary", "")
+    long_adv   = data.get("long_term_advice", "")
+    serving    = data.get("serving_size", "")
+    svgs       = data.get("servings_per_container")
+
+    cal   = data.get("calories", 0)
+    fat   = data.get("total_fat_g")
+    s_fat = data.get("saturated_fat_g")
+    t_fat = data.get("trans_fat_g")
+    chol  = data.get("cholesterol_mg")
+    sod   = data.get("sodium_mg")
+    carbs = data.get("total_carbs_g") or data.get("carbs_g")
+    fiber = data.get("dietary_fiber_g") or data.get("fiber_g")
+    sugar = data.get("sugar_g")
+    prot  = data.get("protein_g", 0)
+
+    SEP = "──────────────────────"
+
+    lines = []
+
+    # Header
+    if itype == "LABEL":
+        svgs_txt = f"{svgs} servings × {serving}" if svgs and serving else (serving or "")
+        lines += [f"🏷️ *{name}*", f"_{svgs_txt}_" if svgs_txt else "", ""]
+    else:
+        conf_e = {"low":"🔴","medium":"🟡","high":"🟢"}.get(data.get("confidence","medium"),"🟡")
+        lines += [f"🍽️ *{name}*", f"_Quantity: {qty}_ {conf_e}", ""]
+
+    # Verdict + summary
+    lines += [
+        f"{v_emoji}  *Overall rating: {verdict.title()}*",
+        "",
+        short_sum if short_sum else "",
+        "",
+    ]
+
+    # Nutrition table
+    per_label = "per serving" if itype == "LABEL" else f"for {qty}"
+    lines += [f"*Nutrition Facts ({per_label})*", SEP]
+    lines.append(f"Calories: *{cal:.0f}*")
+    if fat       is not None: lines.append(f"Total fat: {fat:.1f}g")
+    if s_fat     is not None: lines.append(f"  Saturated fat: {s_fat:.1f}g")
+    if t_fat     is not None: lines.append(f"  Trans fat: {t_fat:.1f}g")
+    if chol      is not None: lines.append(f"Cholesterol: {chol:.0f}mg")
+    if sod       is not None: lines.append(f"Sodium: {sod:.0f}mg")
+    if carbs     is not None: lines.append(f"Total carbs: {carbs:.1f}g")
+    if fiber     is not None: lines.append(f"  Dietary fiber: {fiber:.1f}g")
+    if sugar     is not None: lines.append(f"  Sugar: {sugar:.1f}g")
+    lines.append(f"Protein: {prot:.1f}g")
+    lines.append(SEP)
+
+    # Health alerts
+    alerts = []
+    if sugar  is not None and sugar  > 15: alerts.append(f"🍬 Sugar is very high ({sugar:.1f}g) — limit to avoid health risks.")
+    if sod    is not None and sod    > 600: alerts.append(f"🧂 Sodium is very high ({sod:.0f}mg) — watch your intake.")
+    if fat    is not None and fat    > 20: alerts.append(f"🧈 Fat is high ({fat:.1f}g) — consume sparingly.")
+    if t_fat  is not None and t_fat  > 0:  alerts.append(f"⚠️ Contains trans fat ({t_fat:.1f}g) — avoid if possible.")
+    if verdict == "avoid":                  alerts.append("🚫 This product is not recommended for regular consumption.")
+    if alerts:
+        lines += ["", "*Health Alerts*"] + alerts
+
+    # Long-term advice
+    if long_adv:
+        lines += ["", f"*Long-term:* _{long_adv}_"]
+
+    lines += ["", "_Values are per serving. Consult a doctor for personalised advice._"]
+    return "\n".join(l for l in lines if l is not None)
 
 # ── AI calls (all Groq, fully free) ───────────────────────────────────────────
 def build_photo_prompt(user, log_str):
@@ -173,26 +233,30 @@ def build_photo_prompt(user, log_str):
 Return ONLY a valid JSON object, no markdown, no explanation.
 
 If this is a NUTRITION LABEL, return:
-{{"type":"LABEL","food_name":"product name","serving_size":"e.g. 30g","servings_per_container":null,"calories":0,"protein_g":0,"carbs_g":0,"fat_g":0,"fiber_g":null,"sugar_g":null,"advice":"2-3 sentence fun personalized reaction"}}
+{{"type":"LABEL","food_name":"product name","serving_size":"e.g. 200ml","servings_per_container":null,"calories":0,"total_fat_g":0,"saturated_fat_g":null,"trans_fat_g":null,"cholesterol_mg":null,"sodium_mg":null,"total_carbs_g":0,"dietary_fiber_g":null,"sugar_g":null,"protein_g":0,"overall_verdict":"excellent|good|moderate|poor|avoid","short_summary":"1-2 sentence plain English diet advice personalized to user","long_term_advice":"1 sentence about daily consumption impact","advice":"1-2 sentence fun clingy personalized reaction using their name"}}
 
 If this is a FOOD or MEAL photo, return:
-{{"type":"FOOD","food_name":"name of food","calories":0,"protein_g":0,"carbs_g":0,"fat_g":0,"fiber_g":null,"sugar_g":null,"confidence":"low|medium|high","notes":"brief note","advice":"ask how much they ate in a fun clingy 1 sentence"}}
+{{"type":"FOOD","food_name":"name of food","calories":0,"total_fat_g":0,"saturated_fat_g":null,"sodium_mg":null,"total_carbs_g":0,"dietary_fiber_g":null,"sugar_g":null,"protein_g":0,"confidence":"low|medium|high","overall_verdict":"excellent|good|moderate|poor|avoid","short_summary":"1-2 sentence diet advice personalized to user","long_term_advice":"1 sentence about daily consumption impact","advice":"ask how much they ate in a fun clingy 1 sentence"}}
+
+Verdict guide: excellent=very healthy daily food, good=mostly healthy, moderate=okay occasionally, poor=limit consumption, avoid=very high sugar/sodium/fat.
 
 User profile: {health_profile(user)}
 Today so far: {log_str}
 
-Advice rules: use their first name, be dramatic if diabetic and food is high sugar, warn if going over daily calorie goal, be encouraging for healthy choices."""
+Advice/summary rules: use their first name, be dramatic if diabetic and food is high sugar, warn if going over daily calorie goal, be encouraging for healthy choices."""
 
 def build_food_qty_prompt(user, log_str, qty):
     return f"""You are NutriScan. This is a food photo. The person ate: "{qty}".
 
 Estimate nutrition for that quantity and return ONLY valid JSON, no markdown:
-{{"food_name":"...","calories":0,"protein_g":0,"carbs_g":0,"fat_g":0,"fiber_g":null,"sugar_g":null,"confidence":"low|medium|high","notes":"brief note","advice":"2-3 sentence fun personalized health reaction"}}
+{{"type":"FOOD","food_name":"...","calories":0,"total_fat_g":0,"saturated_fat_g":null,"sodium_mg":null,"total_carbs_g":0,"dietary_fiber_g":null,"sugar_g":null,"protein_g":0,"confidence":"low|medium|high","overall_verdict":"excellent|good|moderate|poor|avoid","short_summary":"1-2 sentence diet advice personalized to user","long_term_advice":"1 sentence about daily consumption impact","advice":"2-3 sentence fun personalized health reaction"}}
+
+Verdict guide: excellent=very healthy, good=mostly healthy, moderate=okay occasionally, poor=limit, avoid=very high sugar/fat/sodium.
 
 User profile: {health_profile(user)}
 Today so far: {log_str}
 
-Advice rules: use their first name, be clingy if diabetic and food is high sugar/carbs, call out if over daily calories, encourage healthy choices."""
+Advice/summary rules: use their first name, be clingy if diabetic and food is high sugar/carbs, call out if over daily calories, encourage healthy choices."""
 
 async def groq_vision(img_bytes: bytes, mime: str, prompt: str) -> dict:
     b64 = base64.standard_b64encode(img_bytes).decode("utf-8")
@@ -359,7 +423,7 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Log this", callback_data="log_confirm"),
             InlineKeyboardButton("❌ Discard",  callback_data="discard")]])
-        await msg.edit_text(fmt_label(data) + f"\n\n💬 _{advice}_", parse_mode="Markdown", reply_markup=kb)
+        await msg.edit_text(fmt_result(data) + f"\n\n💬 _{advice}_", parse_mode="Markdown", reply_markup=kb)
         return ConversationHandler.END
     else:
         # Store image for later when user gives quantity
@@ -394,7 +458,7 @@ async def handle_quantity(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Log this", callback_data="log_confirm"),
         InlineKeyboardButton("❌ Discard",  callback_data="discard")]])
-    await msg.edit_text(fmt_food(data, qty) + f"\n\n💬 _{advice}_", parse_mode="Markdown", reply_markup=kb)
+    await msg.edit_text(fmt_result(data, qty) + f"\n\n💬 _{advice}_", parse_mode="Markdown", reply_markup=kb)
     return ConversationHandler.END
 
 async def cb_log(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
